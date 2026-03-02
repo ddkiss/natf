@@ -79,13 +79,13 @@ EOF
 resolve_domain() {
     local domain=$1
     local v=$2
-    if [[ $domain =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ $domain =~ ^[0-9a-fA-F:]+$ ]]; then
+    if [[ $domain =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ $domain =~ ":" ]]; then
         echo "$domain"
         return
     fi
-    if [ "$v" = "ipv4" ] || [ "$v" = "all" ]; then
+    if [ "$v" = "ipv4" ] || [ "$v" = "all" ] || [ "$v" = "ip" ]; then
         getent ahosts "$domain" 2>/dev/null | awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print $1; exit}' || true
-    elif [ "$v" = "ipv6" ]; then
+    elif [ "$v" = "ipv6" ] || [ "$v" = "ip6" ]; then
         getent ahosts "$domain" 2>/dev/null | awk '$1 ~ /:/ {print $1; exit}' || true
     fi
 }
@@ -110,19 +110,19 @@ process_rule() {
     local chain="" src_ip="" dst_port="" dst_port_end=""
 
     # 使用 ${RULE[key]+set} 安全检查键是否存在
-    [ -n "${RULE[type]+set}" ] && type="${RULE[type]//\"/}"
-    [ -n "${RULE[sport]+set}" ] && sport="${RULE[sport]//\"/}"
-    [ -n "${RULE[dport]+set}" ] && dport="${RULE[dport]//\"/}"
-    [ -n "${RULE[domain]+set}" ] && domain="${RULE[domain]//\"/}"
-    [ -n "${RULE[protocol]+set}" ] && protocol="${RULE[protocol]//\"/}"
-    [ -n "${RULE[ip_version]+set}" ] && ip_version="${RULE[ip_version]//\"/}"
-    [ -n "${RULE[port_start]+set}" ] && port_start="${RULE[port_start]//\"/}"
-    [ -n "${RULE[port_end]+set}" ] && port_end="${RULE[port_end]//\"/}"
-    [ -n "${RULE[sport_end]+set}" ] && sport_end="${RULE[sport_end]//\"/}"
-    [ -n "${RULE[chain]+set}" ] && chain="${RULE[chain]//\"/}"
-    [ -n "${RULE[src_ip]+set}" ] && src_ip="${RULE[src_ip]//\"/}"
-    [ -n "${RULE[dst_port]+set}" ] && dst_port="${RULE[dst_port]//\"/}"
-    [ -n "${RULE[dst_port_end]+set}" ] && dst_port_end="${RULE[dst_port_end]//\"/}"
+    [ -n "${RULE[type]+set}" ] && { type="${RULE[type]#\"}"; type="${type%\"}"; }
+    [ -n "${RULE[sport]+set}" ] && { sport="${RULE[sport]#\"}"; sport="${sport%\"}"; }
+    [ -n "${RULE[dport]+set}" ] && { dport="${RULE[dport]#\"}"; dport="${dport%\"}"; }
+    [ -n "${RULE[domain]+set}" ] && { domain="${RULE[domain]#\"}"; domain="${domain%\"}"; }
+    [ -n "${RULE[protocol]+set}" ] && { protocol="${RULE[protocol]#\"}"; protocol="${protocol%\"}"; }
+    [ -n "${RULE[ip_version]+set}" ] && { ip_version="${RULE[ip_version]#\"}"; ip_version="${ip_version%\"}"; }
+    [ -n "${RULE[port_start]+set}" ] && { port_start="${RULE[port_start]#\"}"; port_start="${port_start%\"}"; }
+    [ -n "${RULE[port_end]+set}" ] && { port_end="${RULE[port_end]#\"}"; port_end="${port_end%\"}"; }
+    [ -n "${RULE[sport_end]+set}" ] && { sport_end="${RULE[sport_end]#\"}"; sport_end="${sport_end%\"}"; }
+    [ -n "${RULE[chain]+set}" ] && { chain="${RULE[chain]#\"}"; chain="${chain%\"}"; }
+    [ -n "${RULE[src_ip]+set}" ] && { src_ip="${RULE[src_ip]#\"}"; src_ip="${src_ip%\"}"; }
+    [ -n "${RULE[dst_port]+set}" ] && { dst_port="${RULE[dst_port]#\"}"; dst_port="${dst_port%\"}"; }
+    [ -n "${RULE[dst_port_end]+set}" ] && { dst_port_end="${RULE[dst_port_end]#\"}"; dst_port_end="${dst_port_end%\"}"; }
     
     local protos=()
     if [ "$protocol" = "all" ]; then protos=("tcp" "udp"); else protos=("$protocol"); fi
@@ -134,10 +134,12 @@ process_rule() {
         for v in "${versions[@]}"; do
             local nft_v="ip"
             [[ "$v" == "ipv6" || "$v" == "ip6" ]] && nft_v="ip6"
-            local daddr=$(resolve_domain "$domain" "$v")
+            local daddr=$(resolve_domain "$domain" "$nft_v")
             [ -z "$daddr" ] && continue
+            if [[ "$daddr" =~ ":" ]] && [ "$nft_v" = "ip" ]; then continue; fi
+            if [[ "$daddr" =~ \. ]] && [ "$nft_v" = "ip6" ]; then continue; fi
             for p in "${protos[@]}"; do
-                echo "add rule $nft_v self-nat prerouting $p dport $sport dnat to $daddr:$dport" >> "$NFT_SCRIPT"
+                echo "add rule $nft_v self-nat prerouting fib daddr type local $p dport $sport dnat to $daddr:$dport" >> "$NFT_SCRIPT"
             done
         done
         
@@ -146,10 +148,12 @@ process_rule() {
         for v in "${versions[@]}"; do
             local nft_v="ip"
             [[ "$v" == "ipv6" || "$v" == "ip6" ]] && nft_v="ip6"
-            local daddr=$(resolve_domain "$domain" "$v")
+            local daddr=$(resolve_domain "$domain" "$nft_v")
             [ -z "$daddr" ] && continue
+            if [[ "$daddr" =~ ":" ]] && [ "$nft_v" = "ip" ]; then continue; fi
+            if [[ "$daddr" =~ \. ]] && [ "$nft_v" = "ip6" ]; then continue; fi
             for p in "${protos[@]}"; do
-                echo "add rule $nft_v self-nat prerouting $p dport $port_start-$port_end dnat to $daddr" >> "$NFT_SCRIPT"
+                echo "add rule $nft_v self-nat prerouting fib daddr type local $p dport $port_start-$port_end dnat to $daddr" >> "$NFT_SCRIPT"
             done
         done
         
@@ -161,7 +165,7 @@ process_rule() {
             local nft_v="ip"
             [[ "$v" == "ipv6" || "$v" == "ip6" ]] && nft_v="ip6"
             for p in "${protos[@]}"; do
-                echo "add rule $nft_v self-nat prerouting $p dport $sp redirect to :$dport" >> "$NFT_SCRIPT"
+                echo "add rule $nft_v self-nat prerouting fib daddr type local $p dport $sp redirect to :$dport" >> "$NFT_SCRIPT"
             done
         done
         
@@ -176,11 +180,15 @@ process_rule() {
         for v in "${versions[@]}"; do
             local nft_v="ip"
             [[ "$v" == "ipv6" || "$v" == "ip6" ]] && nft_v="ip6"
+            if [[ "$src_ip" =~ ":" ]] && [ "$nft_v" = "ip" ]; then continue; fi
+            if [[ "$src_ip" =~ \. ]] && [ "$nft_v" = "ip6" ]; then continue; fi
             for p in "${protos[@]}"; do
                 local port_expr=""
                 if [ -n "$dst_port" ]; then
                     if [ -n "$dst_port_end" ]; then port_expr="$p dport $dst_port-$dst_port_end"
                     else port_expr="$p dport $dst_port"; fi
+                elif [[ "$p" == "tcp" || "$p" == "udp" ]]; then
+                    port_expr="meta l4proto $p"
                 fi
                 echo "add rule $nft_v self-filter $chain $filter_expr $port_expr drop" >> "$NFT_SCRIPT"
             done
