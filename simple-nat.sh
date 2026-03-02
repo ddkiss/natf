@@ -1,6 +1,6 @@
 #!/bin/bash
 # 简单的 nftables NAT 管理脚本 (纯 Bash 实现，兼容 TOML 配置)
-# 依赖环境: bash 4.0+ (支持关联数组), awk, getent, nft
+# 修复了在旧版本 Bash 中开启 set -u 时空关联数组报错的问题
 set -euo pipefail
 
 # 默认配置路径
@@ -75,16 +75,14 @@ table ip6 self-filter {
 }
 EOF
 
-# 简易 DNS 解析函数 (利用 getent)
+# 简易 DNS 解析函数
 resolve_domain() {
     local domain=$1
     local v=$2
-    # 如果已经是 IP，直接返回
     if [[ $domain =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ $domain =~ ^[0-9a-fA-F:]+$ ]]; then
         echo "$domain"
         return
     fi
-    # 否则解析
     if [ "$v" = "ipv4" ] || [ "$v" = "all" ]; then
         getent ahosts "$domain" | awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print $1; exit}'
     elif [ "$v" = "ipv6" ]; then
@@ -92,32 +90,33 @@ resolve_domain() {
     fi
 }
 
+# 预先声明关联数组
 declare -A RULE
 
 # 核心处理组装函数
 process_rule() {
-    # 修复点：使用 [[ ]] 避免 set -u 在数组为空时报错
-    if [[ ${#RULE[@]} -eq 0 ]]; then return; fi
+    # 修复点：使用 ! 获取所有键名，并配合 - 默认值扩展
+    # 这在 set -u 下即使数组为空也不会报错，且能准确判断数组是否有内容
+    if [ -z "${!RULE[*]-}" ]; then
+        return
+    fi
     
-    # 提取值并去引号
     local type="" sport="" dport="" domain="" protocol="all" ip_version="all"
     local port_start="" port_end="" sport_end=""
     local chain="" src_ip="" dst_port="" dst_port_end=""
 
+    # 提取值并去引号
     [ -n "${RULE[type]+set}" ] && type="${RULE[type]//\"/}"
     [ -n "${RULE[sport]+set}" ] && sport="${RULE[sport]//\"/}"
     [ -n "${RULE[dport]+set}" ] && dport="${RULE[dport]//\"/}"
     [ -n "${RULE[domain]+set}" ] && domain="${RULE[domain]//\"/}"
-    
     [ -n "${RULE[protocol]+set}" ] && protocol="${RULE[protocol]//\"/}"
     [ -n "${RULE[ip_version]+set}" ] && ip_version="${RULE[ip_version]//\"/}"
     
-    # Range 独有字段
     [ -n "${RULE[port_start]+set}" ] && port_start="${RULE[port_start]//\"/}"
     [ -n "${RULE[port_end]+set}" ] && port_end="${RULE[port_end]//\"/}"
     [ -n "${RULE[sport_end]+set}" ] && sport_end="${RULE[sport_end]//\"/}"
     
-    # Drop 独有字段
     [ -n "${RULE[chain]+set}" ] && chain="${RULE[chain]//\"/}"
     [ -n "${RULE[src_ip]+set}" ] && src_ip="${RULE[src_ip]//\"/}"
     [ -n "${RULE[dst_port]+set}" ] && dst_port="${RULE[dst_port]//\"/}"
@@ -128,12 +127,11 @@ process_rule() {
     local versions=()
     if [ "$ip_version" = "all" ]; then versions=("ip" "ip6"); else versions=("$ip_version"); fi
 
-    # ======== 1. 单端口转发 ========
+    # 1. 单端口转发
     if [ "$type" = "single" ]; then
         for v in "${versions[@]}"; do
             local nft_v="ip"
             [ "$v" = "ipv6" ] || [ "$v" = "ip6" ] && nft_v="ip6"
-            
             local daddr=$(resolve_domain "$domain" "$v")
             if [ -z "$daddr" ]; then continue; fi
             for p in "${protos[@]}"; do
@@ -141,12 +139,11 @@ process_rule() {
             done
         done
         
-    # ======== 2. 端口段转发 ========
+    # 2. 端口段转发
     elif [ "$type" = "range" ]; then
         for v in "${versions[@]}"; do
             local nft_v="ip"
             [ "$v" = "ipv6" ] || [ "$v" = "ip6" ] && nft_v="ip6"
-            
             local daddr=$(resolve_domain "$domain" "$v")
             if [ -z "$daddr" ]; then continue; fi
             for p in "${protos[@]}"; do
@@ -154,7 +151,7 @@ process_rule() {
             done
         done
         
-    # ======== 3. 端口重定向 ========
+    # 3. 端口重定向
     elif [ "$type" = "redirect" ]; then
         local sp="$sport"
         [ -n "$sport_end" ] && sp="$sport-$sport_end"
@@ -166,7 +163,7 @@ process_rule() {
             done
         done
         
-    # ======== 4. 过滤丢弃 ========
+    # 4. 过滤丢弃
     elif [ "$type" = "drop" ]; then
         local filter_expr=""
         if [ -n "$src_ip" ]; then
@@ -175,44 +172,36 @@ process_rule() {
             [ "${versions[0]}" = "ipv6" ] && prefix="ip6"
             filter_expr="$prefix saddr $src_ip"
         fi
-        
         for v in "${versions[@]}"; do
             local nft_v="ip"
             [ "$v" = "ipv6" ] || [ "$v" = "ip6" ] && nft_v="ip6"
             for p in "${protos[@]}"; do
                 local port_expr=""
                 if [ -n "$dst_port" ]; then
-                    if [ -n "$dst_port_end" ]; then
-                        port_expr="$p dport $dst_port-$dst_port_end"
-                    else
-                        port_expr="$p dport $dst_port"
-                    fi
+                    if [ -n "$dst_port_end" ]; then port_expr="$p dport $dst_port-$dst_port_end"
+                    else port_expr="$p dport $dst_port"; fi
                 fi
                 echo "add rule $nft_v self-filter $chain $filter_expr $port_expr drop" >> "$NFT_SCRIPT"
             done
         done
     fi
     
-    # 修复点：彻底重置关联数组，确保下一次读取不受旧数据干扰
+    # 清空关联数组
     unset RULE
     declare -A RULE
 }
 
 echo "[*] 正在解析配置文件 $CONFIG_FILE ..."
 
-# 简易 TOML 解析器 (状态机模式)
 while IFS= read -r line || [ -n "$line" ]; do
-    # 移除注释、去除首尾空格
     line=$(echo "$line" | sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
     [ -z "$line" ] && continue
     
-    # 遇到新的表 [[rules]] 标志则处理上一个暂存的数据
     if [[ "$line" == "[[rules]]" ]]; then
         process_rule
         continue
     fi
     
-    # 匹配 key = value 格式
     if [[ "$line" =~ ^([a-zA-Z0-9_]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
         key="${BASH_REMATCH[1]}"
         val="${BASH_REMATCH[2]}"
@@ -220,7 +209,7 @@ while IFS= read -r line || [ -n "$line" ]; do
     fi
 done < "$CONFIG_FILE"
 
-# 最后一条规则收尾
+# 处理最后一条规则
 process_rule
 
 echo "[*] 生成的 nftables 脚本位于: $NFT_SCRIPT"
