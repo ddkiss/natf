@@ -96,10 +96,10 @@ declare -A RULE
 
 # 核心处理组装函数
 process_rule() {
-    if [ ${#RULE[@]} -eq 0 ]; then return; fi
+    # 修复点：使用 [[ ]] 避免 set -u 在数组为空时报错
+    if [[ ${#RULE[@]} -eq 0 ]]; then return; fi
     
     # 提取值并去引号
-    # 使用条件测试避免 set -u (-e) 在键不存在时报错
     local type="" sport="" dport="" domain="" protocol="all" ip_version="all"
     local port_start="" port_end="" sport_end=""
     local chain="" src_ip="" dst_port="" dst_port_end=""
@@ -150,7 +150,6 @@ process_rule() {
             local daddr=$(resolve_domain "$domain" "$v")
             if [ -z "$daddr" ]; then continue; fi
             for p in "${protos[@]}"; do
-                # 端口段转发省略 dport 目标位即为映射原形逻辑保持一致
                 echo "add rule $nft_v self-nat prerouting $p dport $port_start-$port_end dnat to $daddr" >> "$NFT_SCRIPT"
             done
         done
@@ -194,8 +193,9 @@ process_rule() {
         done
     fi
     
-    # 清空当前 Rule，准备读取下一个
-    RULE=()
+    # 修复点：彻底重置关联数组，确保下一次读取不受旧数据干扰
+    unset RULE
+    declare -A RULE
 }
 
 echo "[*] 正在解析配置文件 $CONFIG_FILE ..."
@@ -212,7 +212,7 @@ while IFS= read -r line || [ -n "$line" ]; do
         continue
     fi
     
-    # 匹配 key = value 格式 (支持引号并稍作容错)
+    # 匹配 key = value 格式
     if [[ "$line" =~ ^([a-zA-Z0-9_]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
         key="${BASH_REMATCH[1]}"
         val="${BASH_REMATCH[2]}"
