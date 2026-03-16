@@ -1,15 +1,52 @@
 #!/bin/bash
 # 简单的 nftables NAT 管理脚本 (兼容旧版 Bash set -u 逻辑)
-# 依赖环境: bash 4.0+, awk, getent, nft
+# 依赖环境: bash 4.0+, python3 (tomllib/tomli), awk, getent, nft
 set -euo pipefail
 
 # 默认配置路径
-CONFIG_FILE=${1:-/etc/nat.toml}
-NFT_SCRIPT="/tmp/apply_nat.nft"
+CONFIG_FILE="/etc/nat.toml"
+AUTO_CONFIRM="${NATF_FORCE:-0}"
+NFT_SCRIPT=""
+PARSED_RULES_FILE=""
+
+cleanup() {
+    rm -f "$NFT_SCRIPT" "$PARSED_RULES_FILE"
+}
+
+usage() {
+    echo "用法: $0 [--yes] [配置文件路径]"
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --yes)
+            AUTO_CONFIRM=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -*)
+            echo "错误: 不支持的参数 $1"
+            usage
+            exit 1
+            ;;
+        *)
+            if [ "$CONFIG_FILE" != "/etc/nat.toml" ]; then
+                echo "错误: 只能提供一个配置文件路径"
+                usage
+                exit 1
+            fi
+            CONFIG_FILE="$1"
+            shift
+            ;;
+    esac
+done
 
 if [ ! -f "$CONFIG_FILE" ]; then
     echo "错误: 找不到配置文件 $CONFIG_FILE"
-    echo "用法: $0 [配置文件路径]"
+    usage
     exit 1
 fi
 
@@ -17,6 +54,11 @@ if [ "$(id -u)" -ne 0 ]; then
     echo "权限错误: 请以 root 身份运行此脚本。"
     exit 1
 fi
+
+umask 077
+NFT_SCRIPT=$(mktemp "${TMPDIR:-/tmp}/apply_nat.XXXXXX.nft")
+PARSED_RULES_FILE=$(mktemp "${TMPDIR:-/tmp}/parsed_rules.XXXXXX.bin")
+trap cleanup EXIT
 
 # 初始化生成的 nftables 规则集
 cat > "$NFT_SCRIPT" << 'EOF'
@@ -88,6 +130,67 @@ resolve_domain() {
     elif [ "$v" = "ipv6" ] || [ "$v" = "ip6" ]; then
         getent ahosts "$domain" 2>/dev/null | awk '$1 ~ /:/ {print $1; exit}' || true
     fi
+}
+
+parse_toml_rules() {
+    python3 - "$1" <<'PY'
+import sys
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        print("错误: 需要 Python 3.11+ 自带的 tomllib，或额外安装 tomli。", file=sys.stderr)
+        sys.exit(1)
+
+config_path = sys.argv[1]
+
+try:
+    with open(config_path, "rb") as f:
+        data = tomllib.load(f)
+except tomllib.TOMLDecodeError as exc:
+    print(f"错误: TOML 解析失败 ({config_path}:{exc.lineno}:{exc.colno}): {exc.msg}", file=sys.stderr)
+    sys.exit(1)
+except OSError as exc:
+    print(f"错误: 读取配置文件失败 ({config_path}): {exc}", file=sys.stderr)
+    sys.exit(1)
+
+rules = data.get("rules")
+if rules is None:
+    sys.exit(0)
+if not isinstance(rules, list):
+    print("错误: 顶层字段 rules 必须是数组表 [[rules]]。", file=sys.stderr)
+    sys.exit(1)
+
+for index, rule in enumerate(rules, start=1):
+    if not isinstance(rule, dict):
+        print(f"错误: rules[{index}] 必须是对象。", file=sys.stderr)
+        sys.exit(1)
+
+    sys.stdout.buffer.write(b"__RULE__\0")
+    for key, value in rule.items():
+        if not isinstance(key, str):
+            print(f"错误: rules[{index}] 包含非字符串键。", file=sys.stderr)
+            sys.exit(1)
+
+        if isinstance(value, bool):
+            normalized = "true" if value else "false"
+        elif isinstance(value, (str, int, float)):
+            normalized = str(value)
+        else:
+            print(
+                f"错误: rules[{index}].{key} 的值类型不受支持: {type(value).__name__}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        sys.stdout.buffer.write(key.encode("utf-8"))
+        sys.stdout.buffer.write(b"\0")
+        sys.stdout.buffer.write(normalized.encode("utf-8"))
+        sys.stdout.buffer.write(b"\0")
+PY
 }
 
 # 全局声明关联数组
@@ -201,32 +304,49 @@ process_rule() {
 
 echo "[*] 正在解析配置文件 $CONFIG_FILE ..."
 
-# 简易 TOML 解析
-while IFS= read -r line || [ -n "$line" ]; do
-    # 移除注释和前后空格
-    line=$(echo "$line" | sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-    [ -z "$line" ] && continue
-    
-    if [[ "$line" == "[[rules]]" ]]; then
+if ! parse_toml_rules "$CONFIG_FILE" > "$PARSED_RULES_FILE"; then
+    exit 1
+fi
+
+while IFS= read -r -d '' item; do
+    if [ "$item" = "__RULE__" ]; then
         process_rule
         continue
     fi
-    
-    # 解析 key = value
-    if [[ "$line" =~ ^([a-zA-Z0-9_]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
-        key="${BASH_REMATCH[1]}"
-        val="${BASH_REMATCH[2]}"
-        # 显式使用全局变量赋值
-        RULE["$key"]="$val"
+
+    key="$item"
+    if ! IFS= read -r -d '' val; then
+        echo "错误: 解析后的规则数据不完整。"
+        exit 1
     fi
-done < "$CONFIG_FILE"
+    RULE["$key"]="$val"
+done < "$PARSED_RULES_FILE"
 
 # 处理最后一条规则
 process_rule
 
 echo "[*] 生成的 nftables 脚本位于: $NFT_SCRIPT"
-echo "[*] 正在重置并应用 nftables 规则..."
+if [ "$AUTO_CONFIRM" != "1" ]; then
+    echo "[!] 即将执行 'flush ruleset'，这会清空当前机器上的全部 nftables 规则。"
+    if [ ! -t 0 ]; then
+        echo "错误: 当前不是交互式终端。请传入 --yes 或设置 NATF_FORCE=1 后重试。"
+        exit 1
+    fi
+    read -r -p "输入 yes 继续: " confirm
+    if [ "$confirm" != "yes" ]; then
+        echo "[*] 已取消。"
+        exit 1
+    fi
+fi
 
+echo "[*] 正在预检查 nftables 规则..."
+if ! nft -c -f "$NFT_SCRIPT"; then
+    echo "========= [失败] ========="
+    echo "规则预检查失败，未应用任何变更。请检查配置文件中的格式和错误。"
+    exit 1
+fi
+
+echo "[*] 正在重置并应用 nftables 规则..."
 if nft -f "$NFT_SCRIPT"; then
     echo "========= [成功] ========="
     echo "nftables 规则加载成功！"

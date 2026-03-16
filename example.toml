@@ -116,3 +116,13 @@ domain = "dual-stack.example.com"  # 域名同时有 A 和 AAAA 记录
 protocol = "tcp"
 ip_version = "all"     # 根据客户端 IP 版本自动选择
 comment = "双栈 Web 服务"
+
+# 13. 回归样例 - 字符串中包含 # 字符
+[[rules]]
+type = "single"
+sport = 18080
+dport = 8080
+domain = "example.com"
+protocol = "tcp"
+ip_version = "ipv4"
+comment = "回归测试 # 保留字符串内的井号"
